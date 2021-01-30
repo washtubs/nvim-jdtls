@@ -12,13 +12,44 @@ M.extendedClientCapabilities = setup.extendedClientCapabilities
 M.start_or_attach = setup.start_or_attach
 M.setup = setup
 
+local function fix_edit(edit)
+  edit.newText = edit.newText:gsub('\t', '    ')
+end
 
-local function java_apply_workspace_edit(command)
-  for _, argument in ipairs(command.arguments) do
-    vim.lsp.util.apply_workspace_edit(argument)
+local function fix_workspace_edit(workspace_edit)
+  -- Don't actually know if this is needed.
+  if workspace_edit.newText ~= nil then
+    fix_edit(workspace_edit)
+    return
+  end
+
+  for uri, edits in pairs(workspace_edit.changes) do
+    for _, edit in ipairs(edits) do
+      fix_edit(edit)
+    end
   end
 end
 
+local function reorganize_imports(workspace_edit)
+  print(vim.inspect(workspace_edit))
+  local stdin = vim.fn.join(vim.fn.getline(1,'$'), "\n")
+  local file = vim.fn.expand('%:pf:h')
+  local newEdit = vim.fn.json_decode(vim.fn.system("~/java-gen/_import-helper.js "..file, stdin))
+  print(vim.inspect(newEdit))
+  vim.lsp.util.apply_workspace_edit(newEdit)
+  --for uri, edits in pairs(workspace_edit.changes) do
+    --for _, edit in ipairs(edits) do
+      --print(vim.inspect(edit))
+    --end
+  --end
+end
+
+local function java_apply_workspace_edit(command)
+  for _, argument in ipairs(command.arguments) do
+    fix_workspace_edit(argument)
+    vim.lsp.util.apply_workspace_edit(argument)
+  end
+end
 
 local function java_generate_to_string_prompt(_, params)
   request(0, 'java/checkToStringStatus', params, function(err, _, result)
@@ -46,6 +77,7 @@ local function java_generate_to_string_prompt(_, params)
         return
       end
       if edit then
+        fix_workspace_edit(edit)
         vim.lsp.util.apply_workspace_edit(edit)
       end
     end)
@@ -91,12 +123,12 @@ local function java_generate_constructors_prompt(_, code_action_params)
       if err1 then
         print("Could not execute java/generateConstructors: " .. err1.message)
       elseif edit then
+        fix_workspace_edit(edit)
         vim.lsp.util.apply_workspace_edit(edit)
       end
     end)
   end)
 end
-
 
 local function java_generate_delegate_methods_prompt(_, code_action_params)
   request(0, 'java/checkDelegateMethodsStatus', code_action_params, function(err0, _, status)
@@ -145,6 +177,7 @@ local function java_generate_delegate_methods_prompt(_, code_action_params)
       if err1 then
         print('Could not execute java/generateDelegateMethods', err1.message)
       elseif workspace_edit then
+        fix_workspace_edit(workspace_edit)
         vim.lsp.util.apply_workspace_edit(workspace_edit)
       end
     end)
@@ -166,6 +199,7 @@ local function java_hash_code_equals_prompt(_, params)
         print("Could not execute java/generateHashCodeEquals: " .. e.message)
       end
       if edit then
+        fix_workspace_edit(edit)
         vim.lsp.util.apply_workspace_edit(edit)
       end
     end)
@@ -183,6 +217,7 @@ local function handle_refactor_workspace_edit(err, _, result)
   end
 
   if result.edit then
+    fix_workspace_edit(result.edit)
     vim.lsp.util.apply_workspace_edit(result.edit)
   end
 
@@ -255,7 +290,10 @@ local function java_action_organize_imports(_, code_action_params)
       return
     end
     if resp then
+      fix_workspace_edit(resp)
+      -- TODO: use import organize script
       vim.lsp.util.apply_workspace_edit(resp)
+      reorganize_imports(resp)
     end
   end)
 end
@@ -480,6 +518,8 @@ function M.code_action(from_selection, kind)
           return
         end
         if action.edit then
+          print("doing edit")
+          fix_workspace_edit(action.edit)
           vim.lsp.util.apply_workspace_edit(action.edit)
         end
         local command
