@@ -17,6 +17,7 @@ Extensions for the built-in [Language Server Protocol][1] support in [Neovim][2]
   - [x] `hashCode` and `equals` generation.
   - [x] Extract variables or methods
   - [x] Generate delegate methods
+  - [x] Move package, instance method, static method or type
 - [x] `javap` command to show bytecode of current file
 - [x] `jol` command to show memory usage of current file (`jol_path` must be set)
 - [x] `jshell` command to open up jshell with classpath from project set
@@ -52,8 +53,6 @@ the paths**.
 
 - `$HOME/dev/eclipse` needs to be changed to the folder where you cloned the
 repository.
-- `$HOME/workspace` needs to be changed to where you want eclipse.jdt.ls to save
-settings for workspaces.
 - `/usr/lib/jvm/java-14-openjdk/bin/java` needs to be changed to point to your
   Java installation.
 
@@ -81,7 +80,7 @@ GRADLE_HOME=$HOME/gradle /usr/lib/jvm/java-14-openjdk/bin/java \
   -Xmx2G \
   -jar $(echo "$JAR") \
   -configuration "$HOME/dev/eclipse/eclipse.jdt.ls/org.eclipse.jdt.ls.product/target/repository/config_linux" \
-  -data "$HOME/workspace" \
+  -data "${1:-$HOME/workspace}" \
   --add-modules=ALL-SYSTEM \
   --add-opens java.base/java.util=ALL-UNNAMED \
   --add-opens java.base/java.lang=ALL-UNNAMED
@@ -91,7 +90,7 @@ The script must be placed in a folder that is part of `$PATH`. To verify that
 the installation worked, launch it in a shell. You should get the following
 output:
 
-```
+```text
 Content-Length: 126
 
 {"jsonrpc":"2.0","method":"window/logMessage","params":{"type":3,"message":"Sep 16, 2020, 8:10:53 PM Main thread is waiting"}}
@@ -104,7 +103,7 @@ Content-Length: 126
 To use `nvim-jdtls`, you need to setup a LSP client. In your `init.vim` add the
 following:
 
-```
+```vimL
 if has('nvim-0.5')
   augroup lsp
     au!
@@ -116,9 +115,14 @@ endif
 `java-lsp.sh` needs to be changed to the name of the shell script created earlier.
 
 The argument passed to `start_or_attach` is the same `config` mentioned in
-`:help vim.lsp.start_client`. You may want to configure some settings via the
-`init_options`. See the [eclipse.jdt.ls Wiki][8] for an overview of available
-options.
+`:help vim.lsp.start_client`. You may want to configure some settings via
+`init_options` or `settings`. See the [eclipse.jdt.ls Wiki][8] for an overview
+of available options.
+
+You can also find more [complete configuration examples in the Wiki][11].
+
+
+### root_dir configuration
 
 For the language server to work correctly it is important that the `root_dir`
 in the `config` is set correctly. By default `start_or_attach` sets the
@@ -135,6 +139,22 @@ require('jdtls').start_or_attach({cmd = {'java-lsp.sh'}, root_dir = require('jdt
 ```
 
 
+### data directory configuration
+
+`eclipse.jdt.ls` stores project specific data within the folder set via the
+`-data` flag in the `java-lsp.sh` script. If you're using `eclipse.jdt.ls` with
+multiple different projects you should use a dedicated data directory per
+project. You can do that by adding a second argument to the `cmd` property of
+the `config` passed to `start_or_attach`. An example:
+
+
+```lua
+start_or_attach({cmd = {'java-lsp.sh', '/home/user/workspace/' .. vim.fn.fnamemodify(vim.fn.getcwd(), ':p:h:t')}})
+```
+
+
+### lspconfig
+
 **Warning**: Using [nvim-lspconfig][9] in addition to the setup here is not
 required.
 
@@ -142,6 +162,8 @@ You can use it to configure other servers, but you **must not** call
 `require'nvim_lsp'.jdtls.setup{}`. You'd end up running *two* clients and two
 language servers if you do that.
 
+
+### UI picker customization
 
 **Tip**: You can get a better UI for code-actions and other functions by
 overriding the `jdtls.ui` picker. See [UI Extensions][10].
@@ -155,7 +177,7 @@ Neovim, so all the functions mentioned in `:help lsp` will work.
 `nvim-jdtls` provides some extras, for those you'll want to create additional
 mappings:
 
-```
+```vimL
 -- `code_action` is a superset of vim.lsp.buf.code_action and you'll be able to
 -- use this mapping also with other language servers
 nnoremap <A-CR> <Cmd>lua require('jdtls').code_action()<CR>
@@ -179,7 +201,7 @@ Some methods are better exposed via commands. As a shortcut you can also call
 `:lua require('jdtls.setup').add_commands()` to declare these. It's recommended to call `add_commands` within the `on_attach` handler that can be set on the `config` table which is passed to `start_or_attach`.
 
 
-```
+```vimL
 command! -buffer JdtCompile lua require('jdtls').compile()
 command! -buffer JdtUpdateConfig lua require('jdtls').update_project_config()
 command! -buffer JdtJol lua require('jdtls').jol()
@@ -336,3 +358,4 @@ Try wiping your workspace folder and restart Neovim and the language server.
 [8]: https://github.com/eclipse/eclipse.jdt.ls/wiki/Running-the-JAVA-LS-server-from-the-command-line
 [9]: https://github.com/neovim/nvim-lspconfig
 [10]: https://github.com/mfussenegger/nvim-jdtls/wiki/UI-Extensions
+[11]: https://github.com/mfussenegger/nvim-jdtls/wiki/Sample-Configurations

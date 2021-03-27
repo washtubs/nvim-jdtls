@@ -1,16 +1,34 @@
 local api = vim.api
-local uv = vim.loop
 
 local ui = require('jdtls.ui')
-local M = {}
+local util = require('jdtls.util')
+
+local with_java_executable = util.with_java_executable
+local resolve_classname = util.resolve_classname
+local execute_command = util.execute_command
+
+local jdtls_dap = require('jdtls.dap')
+local setup = require('jdtls.setup')
+
+
+
+local M = {
+  setup_dap = jdtls_dap.setup_dap,
+  test_class = jdtls_dap.test_class,
+  test_nearest_method = jdtls_dap.test_nearest_method,
+  pick_test = jdtls_dap.pick_test,
+  extendedClientCapabilities = setup.extendedClientCapabilities,
+  start_or_attach = setup.start_or_attach,
+  setup = setup,
+  settings = {
+    jdt_uri_timeout_ms = 5000,
+  }
+}
+
 local request = vim.lsp.buf_request
 local highlight_ns = api.nvim_create_namespace('jdtls_hl')
 M.jol_path = nil
 
-local setup = require('jdtls.setup')
-M.extendedClientCapabilities = setup.extendedClientCapabilities
-M.start_or_attach = setup.start_or_attach
-M.setup = setup
 
 local function fix_edit(edit)
   edit.newText = edit.newText:gsub('\t', '    ')
@@ -36,7 +54,7 @@ local function reorganize_imports(workspace_edit)
   local file = vim.fn.expand('%:pf:h')
   local newEdit = vim.fn.json_decode(vim.fn.system("~/java-gen/_import-helper.js "..file, stdin))
   print(vim.inspect(newEdit))
-  vim.lsp.util.apply_workspace_edit(newEdit)
+  util.apply_workspace_edit(newEdit)
   --for uri, edits in pairs(workspace_edit.changes) do
     --for _, edit in ipairs(edits) do
       --print(vim.inspect(edit))
@@ -47,7 +65,7 @@ end
 local function java_apply_workspace_edit(command)
   for _, argument in ipairs(command.arguments) do
     fix_workspace_edit(argument)
-    vim.lsp.util.apply_workspace_edit(argument)
+    util.apply_workspace_edit(argument)
   end
 end
 
@@ -78,7 +96,7 @@ local function java_generate_to_string_prompt(_, params)
       end
       if edit then
         fix_workspace_edit(edit)
-        vim.lsp.util.apply_workspace_edit(edit)
+        util.apply_workspace_edit(edit)
       end
     end)
   end)
@@ -124,7 +142,7 @@ local function java_generate_constructors_prompt(_, code_action_params)
         print("Could not execute java/generateConstructors: " .. err1.message)
       elseif edit then
         fix_workspace_edit(edit)
-        vim.lsp.util.apply_workspace_edit(edit)
+        util.apply_workspace_edit(edit)
       end
     end)
   end)
@@ -178,7 +196,7 @@ local function java_generate_delegate_methods_prompt(_, code_action_params)
         print('Could not execute java/generateDelegateMethods', err1.message)
       elseif workspace_edit then
         fix_workspace_edit(workspace_edit)
-        vim.lsp.util.apply_workspace_edit(workspace_edit)
+        util.apply_workspace_edit(workspace_edit)
       end
     end)
   end)
@@ -200,7 +218,7 @@ local function java_hash_code_equals_prompt(_, params)
       end
       if edit then
         fix_workspace_edit(edit)
-        vim.lsp.util.apply_workspace_edit(edit)
+        util.apply_workspace_edit(edit)
       end
     end)
   end)
@@ -218,7 +236,7 @@ local function handle_refactor_workspace_edit(err, _, result)
 
   if result.edit then
     fix_workspace_edit(result.edit)
-    vim.lsp.util.apply_workspace_edit(result.edit)
+    util.apply_workspace_edit(result.edit)
   end
 
   if result.command then
@@ -227,18 +245,191 @@ local function handle_refactor_workspace_edit(err, _, result)
     if fn then
       fn(command, {})
     else
-      M.execute_command(command)
+      execute_command(command)
     end
   end
 end
 
 
-local function mk_refactor_options()
-  local sts = vim.bo.softtabstop;
-  return {
-    tabSize = (sts > 0 and sts) or (sts < 0 and vim.bo.shiftwidth) or vim.bo.tabstop;
-    insertSpaces = vim.bo.expandtab;
+local function move_file(command, code_action_params)
+  local uri = command.arguments[3].uri
+  local params = {
+    moveKind = 'moveResource';
+    sourceUris = { uri, },
+    params = vim.NIL
   }
+  request(0, 'java/getMoveDestinations', params, function(err, _, result)
+    assert(not err, err and err.message or vim.inspect(err))
+    if result and result.errorMessage then
+      print(result.errorMessage)
+      return
+    end
+    if not result or not result.destinations or #result.destinations == 0 then
+      print("Couldn't find any destination packages")
+      return
+    end
+    local destinations = vim.tbl_filter(
+      function(x) return not x.isDefaultPackage end,
+      result.destinations
+    )
+    ui.pick_one_async(
+      destinations,
+      'Target package> ',
+      function(x) return x.project .. ' » ' .. (x.isParentOfSelectedFile and '* ' or '') .. x.displayName end,
+      function(x)
+        local move_params = {
+          moveKind = 'moveResource',
+          sourceUris = { uri, },
+          params = code_action_params,
+          destination = x,
+          updateReferences = true
+        }
+        request(0, 'java/move', move_params, function(move_err, _, refactor_edit)
+          handle_refactor_workspace_edit(move_err, _, refactor_edit)
+        end)
+      end
+    )
+  end)
+end
+
+
+local function move_instance_method(command, code_action_params)
+  local params = {
+    moveKind = 'moveInstanceMethod';
+    sourceUris = { command.arguments[2].textDocument.uri, };
+    params = code_action_params
+  }
+  request(0, 'java/getMoveDestinations', params, function(err, _, result)
+    assert(not err, err and err.message or vim.inspect(err))
+    if result and result.errorMessage then
+      print(result.errorMessage)
+      return
+    end
+    if not result or not result.destinations or #result.destinations == 0 then
+      print("Couldn't find any destinations")
+      return
+    end
+    ui.pick_one_async(
+      result.destinations,
+      'Destination> ',
+      function(x)
+        local prefix
+        if x.isField then
+          prefix = '[Field]            '
+        else
+          prefix = '[Method Parameter] '
+        end
+        return prefix .. x.type .. ' ' .. x.name
+      end,
+      function(x)
+        params.destination = x
+        params.updateReferences = true
+        request(0, 'java/move', params, function(move_err, _, refactor_edit)
+          handle_refactor_workspace_edit(move_err, _, refactor_edit)
+        end)
+      end
+    )
+  end)
+end
+
+local function search_symbols(project, enclosing_type_name, on_selection)
+  local params = {
+    query = '*',
+    projectName = project,
+    sourceOnly = true,
+  }
+  request(0, 'java/searchSymbols', params, function(err, _, result)
+    assert(not err, err and err.message or vim.inspect(err))
+    if not result or #result == 0 then
+      print("Couldn't find any destinations")
+      return
+    end
+    if enclosing_type_name then
+      result = vim.tbl_filter(
+        function(x)
+          if x.containerName then
+            return enclosing_type_name == x.containerName .. '.' .. x.name
+          else
+            return enclosing_type_name == x.name
+          end
+        end,
+        result
+      )
+    end
+    ui.pick_one_async(
+      result,
+      'Destination> ',
+      function(x) return x.containerName .. ' » ' .. x.name end,
+      on_selection
+    )
+  end)
+end
+
+
+local function move_static_member(command, code_action_params)
+  local member = command.arguments[3]
+  search_symbols(
+    member.projectName,
+    member.enclosingTypeName,
+    function(picked)
+      local move_params = {
+        moveKind = 'moveStaticMember',
+        sourceUris = { command.arguments[2].uri },
+        params = code_action_params,
+        destination = picked
+      }
+      request(0, 'java/move', move_params, function(move_err, _, refactor_edit)
+        handle_refactor_workspace_edit(move_err, _, refactor_edit)
+      end)
+    end
+  )
+end
+
+local function move_type(command, code_action_params)
+  local info = command.arguments[3]
+  if not info.supportedDestinationKinds or #info.supportedDestinationKinds == 0 then
+    print('No available destinations')
+    return
+  end
+  ui.pick_one_async(
+    info.supportedDestinationKinds,
+    'Action> ',
+    function(x)
+      if x == 'newFile' then
+        return string.format('Move type `%s` to new file', info.displayName)
+      else
+        return string.format('Move type `%s` to another class', info.displayName)
+      end
+    end,
+    function(x)
+      if x == 'newFile' then
+        local move_params = {
+          moveKind = 'moveTypeToNewFile',
+          sourceUris = { command.arguments[2].textDocument.uri },
+          params = code_action_params
+        }
+        request(0, 'java/move', move_params, function(move_err, _, refactor_edit)
+          handle_refactor_workspace_edit(move_err, _, refactor_edit)
+        end)
+      else
+        search_symbols(
+          info.projectName,
+          info.enclosingTypeName,
+          function(picked)
+            local move_params = {
+              moveKind = 'moveTypeToClass',
+              sourceUris = { command.arguments[2].uri },
+              params = code_action_params,
+              destination = picked
+            }
+            request(0, 'java/move', move_params, function(move_err, _, refactor_edit)
+              handle_refactor_workspace_edit(move_err, _, refactor_edit)
+            end)
+          end
+        )
+      end
+    end
+  )
 end
 
 
@@ -247,9 +438,26 @@ local function java_apply_refactoring_command(command, code_action_params)
   local params = {
     command = cmd,
     context = code_action_params,
-    options = mk_refactor_options(),
+    options = {
+      tabSize = vim.lsp.util.get_effective_tabstop(),
+      insertSpaces = vim.bo.expandtab,
+    }
   }
+  if cmd == 'moveFile' then
+    return move_file(command, code_action_params)
+  elseif cmd == 'moveInstanceMethod' then
+    return move_instance_method(command, code_action_params)
+  elseif cmd == 'moveStaticMember' then
+    return move_static_member(command, code_action_params)
+  elseif cmd == 'moveType' then
+    return move_type(command, code_action_params)
+  end
   if not vim.tbl_contains(setup.extendedClientCapabilities.inferSelectionSupport, cmd) then
+    request(0, 'java/getRefactorEdit', params, handle_refactor_workspace_edit)
+    return
+  end
+  local range = code_action_params.range
+  if not (range.start.character == range['end'].character and range.start.line == range['end'].line) then
     request(0, 'java/getRefactorEdit', params, handle_refactor_workspace_edit)
     return
   end
@@ -292,7 +500,7 @@ local function java_action_organize_imports(_, code_action_params)
     if resp then
       fix_workspace_edit(resp)
       -- TODO: use import organize script
-      vim.lsp.util.apply_workspace_edit(resp)
+      util.apply_workspace_edit(resp)
       reorganize_imports(resp)
     end
   end)
@@ -357,7 +565,7 @@ M.commands = {
 
 
 if not vim.lsp.handlers['workspace/executeClientCommand'] then
-  vim.lsp.handlers['workspace/executeClientCommand'] = function(_, _, params)
+  vim.lsp.handlers['workspace/executeClientCommand'] = function(_, _, params)  -- luacheck: ignore 122
     local fn = M.commands[params.command]
     if fn then
       local ok, result = pcall(fn, params.arguments)
@@ -448,34 +656,11 @@ end
 
 
 local function make_code_action_params(from_selection, kind)
-  local params = {
-    textDocument = { uri = vim.uri_from_bufnr(0) },
-  }
+  local params
   if from_selection then
-    local start_row, start_col = unpack(api.nvim_buf_get_mark(0, '<'))
-    local end_row, end_col = unpack(api.nvim_buf_get_mark(0, '>'))
-    start_row = start_row - 1
-    end_row = end_row - 1
-    start_col = vim.lsp.util.character_offset(0, start_row, start_col)
-    end_col = vim.lsp.util.character_offset(0, end_row, end_col)
-    -- LSP spec: If you want to specify a range that contains a line including
-    -- the line ending character(s) then use an end position denoting the start
-    -- of the next line
-    local line = api.nvim_buf_get_lines(0, end_row, end_row + 1, true)[1]
-    if line and end_col == (#line - 1) then
-      end_row = end_row + 1
-      end_col = 0
-    end
-    params.range = {
-      ["start"] = { line = start_row, character = start_col };
-      ["end"] = { line = end_row, character = end_col };
-    }
+    params = vim.lsp.util.make_given_range_params()
   else
-    local row, pos = unpack(api.nvim_win_get_cursor(0))
-    params.range = {
-      ["start"] = { line = row - 1; character = pos };
-      ["end"] = { line = row - 1; character = pos };
-    }
+    params = vim.lsp.util.make_range_params()
   end
   local bufnr = api.nvim_get_current_buf()
   params.context = {
@@ -518,9 +703,8 @@ function M.code_action(from_selection, kind)
           return
         end
         if action.edit then
-          print("doing edit")
           fix_workspace_edit(action.edit)
-          vim.lsp.util.apply_workspace_edit(action.edit)
+          util.apply_workspace_edit(action.edit)
         end
         local command
         if type(action.command) == "table" then
@@ -532,7 +716,7 @@ function M.code_action(from_selection, kind)
         if fn then
           fn(command, code_action_params)
         else
-          M.execute_command(command)
+          execute_command(command)
         end
       end
     )
@@ -540,23 +724,8 @@ function M.code_action(from_selection, kind)
 end
 
 
--- Until https://github.com/neovim/neovim/pull/11607 is merged
-function M.execute_command(command, callback)
-  request(0, 'workspace/executeCommand', command, function(err, _, resp)
-    if callback then
-      callback(err, resp)
-    elseif err then
-      print("Could not execute code action: " .. err.message)
-    end
-  end)
-end
-
-
 function M.organize_imports()
-  M.execute_command({
-    command = "java.edit.organizeImports";
-    arguments = { vim.uri_from_bufnr(0) }
-  })
+  java_action_organize_imports(nil, make_code_action_params(false))
 end
 
 
@@ -636,22 +805,6 @@ function M.extract_method(from_selection)
 end
 
 
-local function resolve_classname()
-  local lines = api.nvim_buf_get_lines(0, 0, -1, true)
-  local pkgname
-  for _, line in ipairs(lines) do
-    local match = line:match('package ([a-z\\.]+);')
-    if match then
-      pkgname = match
-      break
-    end
-  end
-  assert(pkgname, 'Could not find package name for current class')
-  local classname = vim.fn.fnamemodify(vim.fn.expand('%'), ':t:r')
-  return pkgname .. '.' .. classname
-end
-
-
 local function with_classpaths(fn)
   local options = vim.fn.json_encode({
     scope = 'runtime';
@@ -660,28 +813,11 @@ local function with_classpaths(fn)
     command = 'java.project.getClasspaths';
     arguments = { vim.uri_from_bufnr(0), options };
   }
-  M.execute_command(cmd, function(err, resp)
+  execute_command(cmd, function(err, resp)
     if err then
       print('Error executing java.project.getClasspaths: ' .. err.message)
     else
       fn(resp)
-    end
-  end)
-end
-
-
-local function with_java_executable(mainclass, project, fn)
-  vim.validate({
-    mainclass = { mainclass, 'string' }
-  })
-  M.execute_command({
-    command = 'vscode.java.resolveJavaExecutable',
-    arguments = { mainclass, project }
-  }, function(err, java_exec)
-    if err then
-      print('Could not resolve java executable: ' .. err.message)
-    else
-      fn(java_exec)
     end
   end)
 end
@@ -766,7 +902,7 @@ function M.open_jdt_link(uri)
   end
   local ok, request_id = client.request('java/classFileContents', params, cb, buf)
   assert(ok, 'Request to `java/classFileContents` must succeed to open JDT URI. Client shutdown?')
-  local timeout_ms = 1000
+  local timeout_ms = M.settings.jdt_uri_timeout_ms
   local wait_ok, reason = vim.wait(timeout_ms, function() return response end)
   local log_path = require('jdtls.path').join(vim.fn.stdpath('cache'), 'lsp.log')
   local buf_content
@@ -797,261 +933,6 @@ function M.open_jdt_link(uri)
   api.nvim_buf_set_lines(buf, 0, -1, false, buf_content)
   api.nvim_buf_set_option(0, 'filetype', 'java')
   api.nvim_command('setlocal nomodifiable')
-end
-
-
-local function enrich_dap_config(config_, on_config)
-  if config_.mainClass
-    and config_.projectName
-    and config_.modulePaths ~= nil
-    and config_.classPaths ~= nil
-    and config_.javaExec then
-    on_config(config_)
-    return
-  end
-  local config = vim.deepcopy(config_)
-  if not config.mainClass then
-    config.mainClass = resolve_classname()
-  end
-  M.execute_command({command = 'vscode.java.resolveMainClass'}, function(err, mainclasses)
-    assert(not err, err and (err.message or vim.inspect(err)))
-
-    if not config.projectName then
-      for _, entry in ipairs(mainclasses) do
-        if entry.mainClass == config.mainClass then
-          config.projectName = entry.projectName
-          break
-        end
-      end
-    end
-    assert(config.projectName, "projectName is missing")
-    with_java_executable(config.mainClass, config.projectName, function(java_exec)
-      config.javaExec = config.javaExec or java_exec
-      local params = {
-        command = 'vscode.java.resolveClasspath',
-        arguments = { config.mainClass, config.projectName }
-      }
-      M.execute_command(params, function(err1, paths)
-        assert(not err1, err1 and (err1.message or vim.inspect(err1)))
-        config.modulePaths = config.modulePaths or paths[1]
-        config.classPaths = config.classPaths or vim.tbl_filter(
-          function(x)
-            return vim.fn.isdirectory(x) == 1 or vim.fn.filereadable(x) == 1
-          end,
-          paths[2]
-        )
-        on_config(config)
-      end)
-    end)
-  end)
-end
-
-
-local function start_debug_adapter(callback)
-  M.execute_command({command = 'vscode.java.startDebugSession'}, function(err0, port)
-    assert(not err0, vim.inspect(err0))
-
-    callback({
-      type = 'server';
-      host = '127.0.0.1';
-      port = port;
-      enrich_config = enrich_dap_config;
-    })
-  end)
-end
-
-
-local TestKind = {
-  None = -1,
-  JUnit = 0,
-  JUnit5 = 1,
-  TestNG = 2
-}
-
-
-local TestLevel = {
-  Root = 0,
-  Folder = 1,
-  Package = 2,
-  Class = 3,
-  Method = 4,
-}
-
-
-local function run_test_codelens(choose_lens, no_match_msg)
-  local status, dap = pcall(require, 'dap')
-  if not status then
-    print('nvim-dap is not available')
-    return
-  end
-  local uri = vim.uri_from_bufnr(0)
-  local cmd_codelens = {
-    command = 'vscode.java.test.search.codelens';
-    arguments = { uri };
-  }
-  M.execute_command(cmd_codelens, function(err0, codelens)
-    if err0 then
-      print('Error fetching codelens: ' .. (err0.message or vim.inspect(err0)))
-      return
-    end
-    local choice = choose_lens(codelens)
-    if not choice then
-      print(no_match_msg)
-      return
-    end
-
-    local methodname = ''
-    local name_parts = vim.split(choice.fullName, '#')
-    local classname = name_parts[1]
-    if #name_parts > 1 then
-      methodname = name_parts[2]
-      if choice.paramTypes and #choice.paramTypes > 0 then
-        methodname = string.format('%s(%s)', methodname, table.concat(choice.paramTypes, ','))
-      end
-    end
-    local req_arguments = {
-      uri = uri;
-      classFullName = classname;
-      testName = methodname;
-      project = choice.project;
-      scope = choice.level;
-      testKind = choice.kind;
-    }
-    if choice.kind == TestKind.JUnit5 and choice.level == TestLevel.Method then
-      req_arguments['start'] = choice.location.range['start']
-      req_arguments['end'] = choice.location.range['end']
-    end
-    local cmd_junit_args = {
-      command = 'vscode.java.test.junit.argument';
-      arguments = { vim.fn.json_encode(req_arguments) };
-    }
-    M.execute_command(cmd_junit_args, function(err1, launch_args)
-      if err1 then
-        print('Error retrieving launch arguments: ' .. (err1.message or vim.inspect(err1)))
-        return
-      end
-      local args = table.concat(launch_args.programArguments, ' ');
-      local config = {
-        name = 'Launch Java Test: ' .. choice.fullName;
-        type = 'java';
-        request = 'launch';
-        mainClass = launch_args.mainClass;
-        projectName = launch_args.projectName;
-        cwd = launch_args.workingDirectory;
-        classPaths = launch_args.classpath;
-        modulePaths = launch_args.modulepath;
-        args = args;
-        vmArgs = table.concat(launch_args.vmArguments, ' ');
-        noDebug = false;
-      }
-      local test_results
-      local server = nil
-      local junit = require('jdtls.junit')
-      print('Running', classname, methodname)
-      dap.run(config, {
-        before = function(conf)
-          server = uv.new_tcp()
-          test_results = junit.mk_test_results()
-          server:bind('127.0.0.1', 0)
-          server:listen(128, function(err2)
-            assert(not err2, err2)
-            local sock = vim.loop.new_tcp()
-            server:accept(sock)
-            sock:read_start(test_results.mk_reader(sock))
-          end)
-          conf.args = conf.args:gsub('-port ([0-9]+)', '-port ' .. server:getsockname().port);
-          return conf
-        end;
-        after = function()
-          server:shutdown()
-          server:close()
-          test_results.show()
-        end;
-      })
-    end)
-  end)
-end
-
-
-function M.test_class()
-  local choose_lens = function(codelens)
-    for _, lens in pairs(codelens) do
-      if lens.level == TestLevel.Class then
-        return lens
-      end
-    end
-  end
-  run_test_codelens(choose_lens, 'No test class found')
-end
-
-
-function M.test_nearest_method()
-  local lnum = api.nvim_win_get_cursor(0)[1]
-  local choose_lens = function(codelens)
-    local candidates = {}
-    for _, lens in pairs(codelens) do
-      if lens.level == TestLevel.Method and lens.location.range.start.line <= lnum then
-        table.insert(candidates, lens)
-      end
-    end
-    if #candidates == 0 then return end
-    table.sort(candidates, function(a, b)
-      return a.location.range.start.line > b.location.range.start.line
-    end)
-    return candidates[1]
-  end
-  run_test_codelens(choose_lens, 'No suitable test method found')
-end
-
-local original_configurations = nil
-
-function M.setup_dap()
-  local status, dap = pcall(require, 'dap')
-  if not status then
-    print('nvim-dap is not available')
-    return
-  end
-  if dap.adapters.java and original_configurations then
-    return
-  end
-
-  dap.adapters.java = start_debug_adapter
-  original_configurations = dap.configurations.java or {}
-  local configurations = vim.deepcopy(original_configurations)
-  dap.configurations.java = configurations
-
-  M.execute_command({command = 'vscode.java.resolveMainClass'}, function(err0, mainclasses)
-    if err0 then
-      print('Could not resolve mainclasses: ' .. err0.message)
-      return
-    end
-
-    for _, mc in pairs(mainclasses) do
-      local mainclass = mc.mainClass
-      local project = mc.projectName
-
-      with_java_executable(mainclass, project, function(java_exec)
-        M.execute_command({command = 'vscode.java.resolveClasspath', arguments = { mainclass, project }}, function(err2, paths)
-          if err2 then
-            print(string.format('Could not resolve classpath and modulepath for %s/%s: %s', project, mainclass, err2.message))
-            return
-          end
-          local config = {
-            type = 'java';
-            name = 'Launch ' .. mainclass;
-            projectName = project;
-            mainClass = mainclass;
-            modulePaths = paths[1];
-            classPaths = paths[2];
-            javaExec = java_exec;
-            request = 'launch';
-            console = 'integratedTerminal';
-          }
-          table.insert(configurations, config)
-        end)
-      end)
-    end
-  end)
 end
 
 
