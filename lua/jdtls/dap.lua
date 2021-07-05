@@ -30,7 +30,7 @@ local function enrich_dap_config(config_, on_config)
         end
       end
     end
-    assert(config.projectName, "projectName is missing")
+    config.projectName = config.projectName or ''
     with_java_executable(config.mainClass, config.projectName, function(java_exec)
       config.javaExec = config.javaExec or java_exec
       local params = {
@@ -127,6 +127,25 @@ local function fetch_lenses(context, on_lenses)
   end)
 end
 
+
+local function merge_unique(xs, ys)
+  local result = {}
+  local seen = {}
+  local both = {}
+  vim.list_extend(both, xs or {})
+  vim.list_extend(both, ys or {})
+
+  for _, x in pairs(both) do
+    if not seen[x] then
+      table.insert(result, x)
+      seen[x] = true
+    end
+  end
+
+  return result
+end
+
+
 local function fetch_launch_args(lens, context, on_launch_args)
   local req_arguments = make_junit_request_args(lens, context.uri)
   local cmd_junit_args = {
@@ -137,7 +156,20 @@ local function fetch_launch_args(lens, context, on_launch_args)
     if err then
       print('Error retrieving launch arguments: ' .. (err.message or vim.inspect(err)))
     else
-      on_launch_args(launch_args)
+      -- the classpath in the launch_args might be missing some classes
+      -- See https://github.com/microsoft/vscode-java-test/issues/1073
+      --
+      -- That is why `java.project.getClasspaths` is used as well.
+      local options = vim.fn.json_encode({ scope = 'test'; })
+      local cmd = {
+        command = 'java.project.getClasspaths';
+        arguments = { vim.uri_from_bufnr(0), options };
+      }
+      util.execute_command(cmd, function(err1, resp)
+        assert(not err1, vim.inspect(err1))
+        launch_args.classpath = merge_unique(launch_args.classpath, resp.classpaths)
+        on_launch_args(launch_args)
+      end)
     end
   end)
 end
@@ -169,7 +201,7 @@ end
 
 local function make_config(lens, launch_args)
   local config = {
-    name = 'Launch Java Test: ' .. lens.fullName;
+    name = lens.fullName;
     type = 'java';
     request = 'launch';
     mainClass = launch_args.mainClass;
@@ -234,7 +266,6 @@ local function run(lens, config, context, opts)
   local test_results
   local server = nil
   local junit = require('jdtls.junit')
-  print('Running', lens.fullName)
 
   if lens.kind == TestKind.TestNG then
     dap.run(config)
@@ -332,36 +363,33 @@ function M.pick_test(opts)
 end
 
 
-local original_configurations = nil
-function M.setup_dap()
-  local status, dap = pcall(require, 'dap')
-  if not status then
-    print('nvim-dap is not available')
-    return
-  end
-  if dap.adapters.java and original_configurations then
-    return
-  end
+local hotcodereplace_type = {
+  ERROR = "ERROR",
+  WARNING = "WARNING",
+  STARTING = "STARTING",
+  END = "END",
+  BUILD_COMPLETE = "BUILD_COMPLETE",
+}
 
-  dap.adapters.java = start_debug_adapter
-  original_configurations = dap.configurations.java or {}
-  local configurations = vim.deepcopy(original_configurations)
-  dap.configurations.java = configurations
 
-  util.execute_command({command = 'vscode.java.resolveMainClass'}, function(err0, mainclasses)
-    if err0 then
-      print('Could not resolve mainclasses: ' .. err0.message)
+function M.fetch_main_configs(callback)
+  local configurations = {}
+  util.execute_command({command = 'vscode.java.resolveMainClass'}, function(err, mainclasses)
+    assert(not err, vim.inspect(err))
+
+    local remaining = #mainclasses
+    if remaining == 0 then
+      callback(configurations)
       return
     end
-
     for _, mc in pairs(mainclasses) do
       local mainclass = mc.mainClass
       local project = mc.projectName
-
       with_java_executable(mainclass, project, function(java_exec)
-        util.execute_command({command = 'vscode.java.resolveClasspath', arguments = { mainclass, project }}, function(err2, paths)
-          if err2 then
-            print(string.format('Could not resolve classpath and modulepath for %s/%s: %s', project, mainclass, err2.message))
+        util.execute_command({command = 'vscode.java.resolveClasspath', arguments = { mainclass, project }}, function(err1, paths)
+          remaining = remaining - 1
+          if err1 then
+            print(string.format('Could not resolve classpath and modulepath for %s/%s: %s', project, mainclass, err1.message))
             return
           end
           local config = {
@@ -376,10 +404,56 @@ function M.setup_dap()
             console = 'integratedTerminal';
           }
           table.insert(configurations, config)
+          if remaining == 0 then
+            callback(configurations)
+          end
         end)
       end)
     end
   end)
+end
+
+local orig_configurations
+function M.setup_dap_main_class_configs()
+  local status, dap = pcall(require, 'dap')
+  if not status then
+    print('nvim-dap is not available')
+    return
+  end
+  if not orig_configurations then
+    orig_configurations = vim.deepcopy(dap.configurations.java) or {}
+  end
+  local current_configurations = vim.deepcopy(orig_configurations)
+  M.fetch_main_configs(function(configurations)
+    vim.list_extend(current_configurations, configurations)
+    dap.configurations.java = current_configurations
+  end)
+end
+
+
+function M.setup_dap(opts)
+  local status, dap = pcall(require, 'dap')
+  if not status then
+    print('nvim-dap is not available')
+    return
+  end
+  if dap.adapters.java then
+    return
+  end
+  opts = opts or {}
+  dap.listeners.before['event_hotcodereplace']['jdtls'] = function(session, body)
+    if body.changeType == hotcodereplace_type.BUILD_COMPLETE then
+      if opts.hotcodereplace == 'auto' then
+        vim.notify('Applying code changes')
+        session:request('redefineClasses', nil, function(err)
+          assert(not err, vim.inspect(err))
+        end)
+      end
+    elseif body.message then
+      vim.notify(body.message)
+    end
+  end
+  dap.adapters.java = start_debug_adapter
 end
 
 

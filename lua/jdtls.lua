@@ -65,7 +65,7 @@ end
 local function java_apply_workspace_edit(command)
   for _, argument in ipairs(command.arguments) do
     fix_workspace_edit(argument)
-    util.apply_workspace_edit(argument)
+    vim.lsp.util.apply_workspace_edit(argument)
   end
 end
 
@@ -96,7 +96,7 @@ local function java_generate_to_string_prompt(_, params)
       end
       if edit then
         fix_workspace_edit(edit)
-        util.apply_workspace_edit(edit)
+        vim.lsp.util.apply_workspace_edit(edit)
       end
     end)
   end)
@@ -142,7 +142,7 @@ local function java_generate_constructors_prompt(_, code_action_params)
         print("Could not execute java/generateConstructors: " .. err1.message)
       elseif edit then
         fix_workspace_edit(edit)
-        util.apply_workspace_edit(edit)
+        vim.lsp.util.apply_workspace_edit(edit)
       end
     end)
   end)
@@ -196,7 +196,7 @@ local function java_generate_delegate_methods_prompt(_, code_action_params)
         print('Could not execute java/generateDelegateMethods', err1.message)
       elseif workspace_edit then
         fix_workspace_edit(workspace_edit)
-        util.apply_workspace_edit(workspace_edit)
+        vim.lsp.util.apply_workspace_edit(workspace_edit)
       end
     end)
   end)
@@ -218,7 +218,7 @@ local function java_hash_code_equals_prompt(_, params)
       end
       if edit then
         fix_workspace_edit(edit)
-        util.apply_workspace_edit(edit)
+        vim.lsp.util.apply_workspace_edit(edit)
       end
     end)
   end)
@@ -236,7 +236,7 @@ local function handle_refactor_workspace_edit(err, _, result)
 
   if result.edit then
     fix_workspace_edit(result.edit)
-    util.apply_workspace_edit(result.edit)
+    vim.lsp.util.apply_workspace_edit(result.edit)
   end
 
   if result.command then
@@ -461,6 +461,7 @@ local function java_apply_refactoring_command(command, code_action_params)
     request(0, 'java/getRefactorEdit', params, handle_refactor_workspace_edit)
     return
   end
+
   request(0, 'java/inferSelection', params, function(err, _, selection_info)
     assert(not err, vim.inspect(err))
     if not selection_info or #selection_info == 0 then
@@ -500,7 +501,7 @@ local function java_action_organize_imports(_, code_action_params)
     if resp then
       fix_workspace_edit(resp)
       -- TODO: use import organize script
-      util.apply_workspace_edit(resp)
+      vim.lsp.util.apply_workspace_edit(resp)
       reorganize_imports(resp)
     end
   end)
@@ -670,10 +671,26 @@ local function make_code_action_params(from_selection, kind)
   return params
 end
 
+
 -- Similar to https://github.com/neovim/neovim/pull/11607, but with extensible commands
 function M.code_action(from_selection, kind)
   local code_action_params = make_code_action_params(from_selection or false, kind)
-  request(0, 'textDocument/codeAction', code_action_params, function(err, _, actions)
+  local function apply_command(action)
+    local command
+    if type(action.command) == "table" then
+      command = action.command
+    else
+      command = action
+    end
+    local fn = M.commands[command.command]
+    if fn then
+      fn(command, code_action_params)
+    else
+      execute_command(command)
+    end
+  end
+  request(0, 'textDocument/codeAction', code_action_params, function(err, _, actions, client_id)
+    local client = vim.lsp.get_client_by_id(client_id)
     assert(not err, vim.inspect(err))
     -- actions is (Command | CodeAction)[] | null
     -- CodeAction
@@ -704,19 +721,19 @@ function M.code_action(from_selection, kind)
         end
         if action.edit then
           fix_workspace_edit(action.edit)
-          util.apply_workspace_edit(action.edit)
-        end
-        local command
-        if type(action.command) == "table" then
-          command = action.command
+          vim.lsp.util.apply_workspace_edit(action.edit)
+        elseif client
+            and type(client.resolved_capabilities.code_action) == 'table'
+            and client.resolved_capabilities.code_action.resolveProvider then
+          client.request('codeAction/resolve', action, function(err1, _, result)
+            assert(not err1, vim.inspect(err1))
+            if result.edit then
+              vim.lsp.util.apply_workspace_edit(result.edit)
+            end
+            apply_command(result)
+          end)
         else
-          command = action
-        end
-        local fn = M.commands[command.command]
-        if fn then
-          fn(command, code_action_params)
-        else
-          execute_command(command)
+          apply_command(action)
         end
       end
     )
@@ -729,14 +746,19 @@ function M.organize_imports()
 end
 
 
-function M.compile(full_compile)
+function M._complete_compile()
+  return 'full\nincremental'
+end
+
+
+function M.compile(type)
   local CompileWorkspaceStatus = {
     FAILED = 0,
     SUCCEED = 1,
     WITHERROR = 2,
     CANCELLED = 3,
   }
-  request(0, 'java/buildWorkspace', full_compile or false, function(err, _, result)
+  request(0, 'java/buildWorkspace', type == 'full', function(err, _, result)
     assert(not err, 'Error on `java/buildWorkspace`: ' .. vim.inspect(err))
     if result == CompileWorkspaceStatus.SUCCEED then
       print('Compile successfull')
@@ -753,11 +775,11 @@ function M.compile(full_compile)
             or vim.endswith(fname, 'pom.xml')
             or (stat and stat.type == 'directory')) then
           items = project_config_errors
-        else
+        elseif vim.fn.fnamemodify(fname, ':e') == 'java' then
           items = compile_errors
         end
         for _, d in pairs(diagnostics) do
-          if d.severity == vim.lsp.protocol.DiagnosticSeverity.Error then
+          if d.severity == vim.lsp.protocol.DiagnosticSeverity.Error and items then
             table.insert(items, {
               bufnr = bufnr,
               lnum = d.range.start.line + 1,
@@ -781,7 +803,6 @@ function M.compile(full_compile)
   end)
 end
 
-
 function M.update_project_config()
   local params = { uri = vim.uri_from_bufnr(0) }
   request(0, 'java/projectConfigurationUpdate', params, function(err)
@@ -793,32 +814,39 @@ function M.update_project_config()
 end
 
 
-function M.extract_variable(from_selection)
-  local params = make_code_action_params(from_selection or false)
-  java_apply_refactoring_command({ arguments = { 'extractVariable' }, }, params)
+local function mk_extract(entity)
+  return function(from_selection)
+    local params = make_code_action_params(from_selection or false)
+    java_apply_refactoring_command({ arguments = { entity }, }, params)
+  end
 end
 
-
-function M.extract_method(from_selection)
-  local params = make_code_action_params(from_selection or false)
-  java_apply_refactoring_command({ arguments = { 'extractMethod' }, }, params)
-end
+M.extract_constant = mk_extract('extractConstant')
+M.extract_variable = mk_extract('extractVariable')
+M.extract_method = mk_extract('extractMethod')
 
 
 local function with_classpaths(fn)
-  local options = vim.fn.json_encode({
-    scope = 'runtime';
-  })
-  local cmd = {
-    command = 'java.project.getClasspaths';
-    arguments = { vim.uri_from_bufnr(0), options };
-  }
-  execute_command(cmd, function(err, resp)
-    if err then
-      print('Error executing java.project.getClasspaths: ' .. err.message)
-    else
-      fn(resp)
-    end
+  local is_test_file_cmd = {
+    command = 'java.project.isTestFile',
+    arguments = { vim.uri_from_bufnr(0) }
+  };
+  execute_command(is_test_file_cmd, function(err, is_test_file)
+    assert(not err, vim.inspect(err))
+    local options = vim.fn.json_encode({
+      scope = is_test_file and 'test' or 'runtime';
+    })
+    local cmd = {
+      command = 'java.project.getClasspaths';
+      arguments = { vim.uri_from_bufnr(0), options };
+    }
+    execute_command(cmd, function(err1, resp)
+      if err1 then
+        print('Error executing java.project.getClasspaths: ' .. err1.message)
+      else
+        fn(resp)
+      end
+    end)
   end)
 end
 
@@ -847,7 +875,7 @@ function M.jshell()
     with_java_executable(resolve_classname(), '', function(java_exec)
       api.nvim_win_set_buf(0, buf)
       local jshell = vim.fn.fnamemodify(java_exec, ':h') .. '/jshell'
-      vim.fn.termopen({jshell, '--class-path', cp})
+      vim.fn.termopen(jshell, { env = { ["CLASSPATH"] = cp }})
     end)
   end)
 end
@@ -877,18 +905,13 @@ end
 --@param uri expected to be a `jdt://` uri
 function M.open_jdt_link(uri)
   local client
-  for _, buf in pairs(vim.fn.getbufinfo({bufloaded=true})) do
-    if api.nvim_buf_get_option(buf.bufnr, 'filetype') == 'java' then
-      local clients = vim.lsp.buf_get_clients(buf.bufnr)
-      for _, c in ipairs(clients) do
-        if c.config.init_options
-          and c.config.init_options.extendedClientCapabilities
-          and c.config.init_options.extendedClientCapabilities.classFileContentsSupport then
+  for _, c in ipairs(vim.lsp.get_active_clients()) do
+    if c.config.init_options
+      and c.config.init_options.extendedClientCapabilities
+      and c.config.init_options.extendedClientCapabilities.classFileContentsSupport then
 
-          client = c
-          break
-        end
-      end
+      client = c
+      break
     end
   end
   assert(client, 'Must have a buffer open with a language client connected to eclipse.jdt.ls to load JDT URI')
@@ -930,9 +953,10 @@ function M.open_jdt_link(uri)
     buf_content = {
       'Failed to load content for uri', uri, '', 'Error was: ', error_msg, '', 'Check the log file for errors', log_path}
   end
+  api.nvim_buf_set_option(buf, 'modifiable', true)
   api.nvim_buf_set_lines(buf, 0, -1, false, buf_content)
   api.nvim_buf_set_option(0, 'filetype', 'java')
-  api.nvim_command('setlocal nomodifiable')
+  api.nvim_buf_set_option(buf, 'modifiable', false)
 end
 
 

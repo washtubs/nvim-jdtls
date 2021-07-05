@@ -2,14 +2,12 @@
 
 Extensions for the built-in [Language Server Protocol][1] support in [Neovim][2] (>= 0.5) for [eclipse.jdt.ls][3].
 
-**Warning**: This is early state. Neovim 0.5 hasn't been released yet, so APIs can change and things may break.
-
-
 ## Extensions
 
-- [x] `organize_imports` command to organize imports
-- [x] `extract_variable` command to introduce a local variable
-- [x] `extract_method` command to extract a block of code into a method
+- [x] `organize_imports` function to organize imports
+- [x] `extract_variable` function to introduce a local variable
+- [x] `extract_constant` function to extract a constant
+- [x] `extract_method` function to extract a block of code into a method
 - [x] Open class file contents
 - [x] Code action extensions
   - [x] Generate constructors
@@ -30,33 +28,31 @@ see some of the functionality in action.
 
 ## Plugin Installation
 
-- Requires [Neovim HEAD/nightly][4]
-- nvim-jdtls is a plugin. Install it like any other Vim plugin.
-- Call `:packadd nvim-jdtls` if you install `nvim-jdtls` to `'packpath'`.
-
+- Requires Neovim (>= 0.5)
+- nvim-jdtls is a plugin. Install it like any other Vim plugin:
+  - If using [vim-plug][14]: `Plug 'mfussenegger/nvim-jdtls'`
+  - If using [packer.nvim][15]: `use 'mfussenegger/nvim-jdtls'`
 
 ## Language Server Installation
 
-For ``nvim-jdtls`` to work, [eclipse.jdt.ls][3] needs to be installed.
+Install [eclipse.jdt.ls][3] using one of the three options:
 
-To build eclipse.jdt.ls from source, switch to a folder of your choice and run:
+1) Install eclipse.jdt.ls via your package manager (Assuming a package is available).
+2) Download a pre-built [milestone][12] or [snapshot][13] and extract the contents of the package.
+3) Build eclipse.jdt.ls from source:
+    - Switch to a folder of your choice.
+    - `git clone https://github.com/eclipse/eclipse.jdt.ls.git`
+    - `cd eclipse.jdt.ls`
+    - `./mvnw clean install -DskipTests` (Set `JAVA_HOME` to Java 11 before you run this)
 
-
-```bash
-git clone https://github.com/eclipse/eclipse.jdt.ls.git
-cd eclipse.jdt.ls
-./mvnw clean verify
-```
 
 Create a launch script with the following contents. **But don't forget to adapt
 the paths**.
 
 - `$HOME/dev/eclipse` needs to be changed to the folder where you cloned the
 repository.
-- `/usr/lib/jvm/java-14-openjdk/bin/java` needs to be changed to point to your
-  Java installation.
-
-If you're using Java < 9, remove the `add-modules` and `-add-opens` options.
+- `/usr/lib/jvm/java-11-openjdk/bin/java` needs to be changed to point to your
+  Java installation. At least Java 11 is required to run the language server.
 
 
 ```bash
@@ -70,7 +66,7 @@ If you're using Java < 9, remove the `add-modules` and `-add-opens` options.
 # to point to the `config_mac' or `config_win` folders depending on your system.
 
 JAR="$HOME/dev/eclipse/eclipse.jdt.ls/org.eclipse.jdt.ls.product/target/repository/plugins/org.eclipse.equinox.launcher_*.jar"
-GRADLE_HOME=$HOME/gradle /usr/lib/jvm/java-14-openjdk/bin/java \
+GRADLE_HOME=$HOME/gradle /usr/lib/jvm/java-11-openjdk/bin/java \
   -Declipse.application=org.eclipse.jdt.ls.core.id1 \
   -Dosgi.bundles.defaultStartLevel=4 \
   -Declipse.product=org.eclipse.jdt.ls.core.product \
@@ -155,13 +151,10 @@ start_or_attach({cmd = {'java-lsp.sh', '/home/user/workspace/' .. vim.fn.fnamemo
 
 ### lspconfig
 
-**Warning**: Using [nvim-lspconfig][9] in addition to the setup here is not
-required.
+**Warning**: You must NOT execute `require'nvim_lsp'.jdtls.setup{}` from
+[nvim-lspconfig][9] if you use `nvim-jdtls`.
 
-You can use it to configure other servers, but you **must not** call
-`require'nvim_lsp'.jdtls.setup{}`. You'd end up running *two* clients and two
-language servers if you do that.
-
+You can use `nvim-lspconfig` for other language servers without problems.
 
 ### UI picker customization
 
@@ -187,6 +180,8 @@ nnoremap <leader>r <Cmd>lua require('jdtls').code_action(false, 'refactor')<CR>
 nnoremap <A-o> <Cmd>lua require'jdtls'.organize_imports()<CR>
 nnoremap crv <Cmd>lua require('jdtls').extract_variable()<CR>
 vnoremap crv <Esc><Cmd>lua require('jdtls').extract_variable(true)<CR>
+nnoremap crc <Cmd>lua require('jdtls').extract_constant()<CR>
+vnoremap crc <Esc><Cmd>lua require('jdtls').extract_constant(true)<CR>
 vnoremap crm <Esc><Cmd>lua require('jdtls').extract_method(true)<CR>
 
 
@@ -198,7 +193,10 @@ nnoremap <leader>dn <Cmd>lua require'jdtls'.test_nearest_method()<CR>
 
 
 Some methods are better exposed via commands. As a shortcut you can also call
-`:lua require('jdtls.setup').add_commands()` to declare these. It's recommended to call `add_commands` within the `on_attach` handler that can be set on the `config` table which is passed to `start_or_attach`.
+`:lua require('jdtls.setup').add_commands()` to declare these.
+
+It's recommended to call `add_commands` within the `on_attach` handler that can be set on the `config` table which is passed to `start_or_attach`.
+If you use jdtls together with nvim-dap, call `add_commands` *after* `setup_dap` to ensure it includes debugging related commands. (More about this is in the debugger setup section further below)
 
 
 ```vimL
@@ -251,16 +249,26 @@ config['init_options'] = {
 ### nvim-dap setup
 
 You also need to call `require('jdtls').setup_dap()` to have it register a
-`java` adapter for `nvim-dap` and to create configurations for all discovered
-main classes.
+`java` adapter.
 
 To do that, extend the configuration for `nvim-jdtls` with:
 
 ```lua
 config['on_attach'] = function(client, bufnr)
-  require('jdtls').setup_dap()
+  -- With `hotcodereplace = 'auto' the debug adapter will try to apply code changes
+  -- you make during a debug session immediately.
+  -- Remove the option if you do not want that.
+  require('jdtls').setup_dap({ hotcodereplace = 'auto' })
 end
 ```
+
+If you also want to discover main classes and create configuration entries for them, you have to call `require('jdtls.dap').setup_dap_main_class_configs()` or use the `JdtRefreshDebugConfigs` command which is added as part of `add_commands()` which is mentioned in the [Usage](#Usage) section.
+
+Note that eclipse.jdt.ls needs to have loaded your project before it can discover all main classes and that may take some time. It is best to trigger this deferred or ad-hoc when first required.
+
+
+See the [nvim-dap Adapter Installation Wiki](https://github.com/mfussenegger/nvim-dap/wiki/Debug-Adapter-installation#Java)
+for example configurations in case you're not going to use the main-class discovery functionality of nvim-jdtls.
 
 ### vscode-java-test installation
 
@@ -305,7 +313,7 @@ If it doesn't, verify:
 
 2. Eclipse.jdt.ls can't compile your project or it cannot load your project and resolve the class paths.
 
-- Run `:JdtCompile` for incremental compilation or `:JdtCompile true` for full
+- Run `:JdtCompile` for incremental compilation or `:JdtCompile full` for full
   compilation. If there are any errors in the project, it will open the
   quickfix list with the errors.
 
@@ -316,7 +324,7 @@ If it doesn't, verify:
 ### Diagnostics and completion suggestions are slow
 
 Completion requests can be quite expensive on big projects. If you're using
-some kind of autoc-ompletion plugin that triggers completion requests
+some kind of auto-completion plugin that triggers completion requests
 automatically, consider deactivating it or tuning it so it is less aggressive.
 Triggering a completion request on each typed character is likely overloading
 [eclipse.jdt.ls][3].
@@ -351,7 +359,6 @@ Try wiping your workspace folder and restart Neovim and the language server.
 [1]: https://microsoft.github.io/language-server-protocol/
 [2]: https://neovim.io/
 [3]: https://github.com/eclipse/eclipse.jdt.ls
-[4]: https://github.com/neovim/neovim/releases/tag/nightly
 [5]: https://github.com/mfussenegger/nvim-dap
 [6]: https://github.com/microsoft/java-debug
 [7]: https://github.com/microsoft/vscode-java-test
@@ -359,3 +366,7 @@ Try wiping your workspace folder and restart Neovim and the language server.
 [9]: https://github.com/neovim/nvim-lspconfig
 [10]: https://github.com/mfussenegger/nvim-jdtls/wiki/UI-Extensions
 [11]: https://github.com/mfussenegger/nvim-jdtls/wiki/Sample-Configurations
+[12]: https://download.eclipse.org/jdtls/milestones/
+[13]: https://download.eclipse.org/jdtls/snapshots/?d
+[14]: https://github.com/junegunn/vim-plug
+[15]: https://github.com/wbthomason/packer.nvim
